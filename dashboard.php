@@ -283,6 +283,24 @@ unset($plant);
                 padding: 18px;
             }
         }
+
+        
+.reminder-button {
+    display: inline-block;
+    padding: 12px 20px;
+    background-color: #2e7d32;
+    color: white;
+    text-decoration: none;
+    font-size: 16px;
+    font-weight: bold;
+    border-radius: 8px;
+    transition: background-color 0.3s ease;
+}
+
+.reminder-button:hover {
+    background-color: #1b5e20;
+}
+
     </style>
 </head>
 
@@ -306,6 +324,14 @@ unset($plant);
             Keep your plants healthy with timely watering reminders.
         </p>
     </section>
+
+    
+<p>
+    <a href="reminders.php" class="reminder-button">
+        💧 Manage Watering Reminders
+    </a>
+</p>
+
 
     <?php if ($notice !== ""): ?>
         <div class="notice" role="status">
