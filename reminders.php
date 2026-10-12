@@ -25,6 +25,9 @@ function e($value): string
     );
 }
 
+// Use the current date for date comparisons
+$today = date("Y-m-d");
+
 // 3. Handle form submissions
 if ($_SERVER["REQUEST_METHOD"] === "POST") {
     $action = $_POST["action"] ?? "";
@@ -41,13 +44,15 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             $message = "Invalid reminder selected.";
             $messageType = "error";
         } else {
-            $sql = "UPDATE watering_reminders AS wr
-                    INNER JOIN plants AS p
-                        ON p.id = wr.plant_id
-                    SET wr.status = 'completed'
-                    WHERE wr.id = ?
-                      AND p.user_id = ?
-                      AND wr.status = 'pending'";
+            $sql = "
+                UPDATE watering_reminders AS wr
+                INNER JOIN plants AS p
+                    ON p.id = wr.plant_id
+                SET wr.status = 'completed'
+                WHERE wr.id = ?
+                  AND p.user_id = ?
+                  AND wr.status = 'pending'
+            ";
 
             $stmt = $conn->prepare($sql);
             $stmt->bind_param("ii", $reminderId, $userId);
@@ -65,7 +70,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
         }
     }
 
-    // Create a new reminder
+    // Create a manual reminder
     elseif ($action === "create") {
         $plantId = filter_input(
             INPUT_POST,
@@ -73,9 +78,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             FILTER_VALIDATE_INT
         );
 
-        $reminderDate = trim(
-            $_POST["reminder_date"] ?? ""
-        );
+        $reminderDate = trim($_POST["reminder_date"] ?? "");
 
         $date = DateTimeImmutable::createFromFormat(
             "!Y-m-d",
@@ -98,16 +101,17 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
             !$plantId ||
             $plantId < 1 ||
             !$validDate ||
-            $reminderDate < date("Y-m-d")
+            $reminderDate < $today
         ) {
             $message = "Please select a plant and a valid date today or later.";
             $messageType = "error";
         } else {
-            // Ensure the plant belongs to this user
-            $check = $conn->prepare(
-                "SELECT id FROM plants
-                 WHERE id = ? AND user_id = ?"
-            );
+            // Verify that the plant belongs to the logged-in user
+            $check = $conn->prepare("
+                SELECT id
+                FROM plants
+                WHERE id = ? AND user_id = ?
+            ");
 
             $check->bind_param("ii", $plantId, $userId);
             $check->execute();
@@ -119,11 +123,12 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                 $message = "Plant not found or access denied.";
                 $messageType = "error";
             } else {
-                // Check for a duplicate reminder
-                $check = $conn->prepare(
-                    "SELECT id FROM watering_reminders
-                     WHERE plant_id = ? AND reminder_date = ?"
-                );
+                // Prevent duplicate reminders
+                $check = $conn->prepare("
+                    SELECT id
+                    FROM watering_reminders
+                    WHERE plant_id = ? AND reminder_date = ?
+                ");
 
                 $check->bind_param(
                     "is",
@@ -139,11 +144,11 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                     $message = "A reminder already exists for this plant and date.";
                     $messageType = "error";
                 } else {
-                    $insert = $conn->prepare(
-                        "INSERT INTO watering_reminders
-                         (plant_id, reminder_date, status)
-                         VALUES (?, ?, 'pending')"
-                    );
+                    $insert = $conn->prepare("
+                        INSERT INTO watering_reminders
+                            (plant_id, reminder_date, status)
+                        VALUES (?, ?, 'pending')
+                    ");
 
                     $insert->bind_param(
                         "is",
@@ -178,13 +183,82 @@ if (isset($_GET["created"])) {
     $messageType = "success";
 }
 
-// 5. Fetch plants belonging to this user
-$stmt = $conn->prepare(
-    "SELECT id, plant_name
-     FROM plants
-     WHERE user_id = ?
-     ORDER BY plant_name"
-);
+// 5. Automatically generate the next watering reminder
+// for each plant belonging to the logged-in user.
+//
+// This generates one reminder for the next calculated date.
+// Past dates are skipped.
+
+$autoStmt = $conn->prepare("
+    SELECT id, last_watered, watering_interval
+    FROM plants
+    WHERE user_id = ?
+      AND last_watered IS NOT NULL
+      AND watering_interval > 0
+");
+
+$autoStmt->bind_param("i", $userId);
+$autoStmt->execute();
+
+$autoPlants = $autoStmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$autoStmt->close();
+
+$insertAuto = $conn->prepare("
+    INSERT INTO watering_reminders
+        (plant_id, reminder_date, status)
+    SELECT ?, ?, 'pending'
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM watering_reminders
+        WHERE plant_id = ?
+          AND reminder_date = ?
+    )
+");
+
+foreach ($autoPlants as $autoPlant) {
+    $lastWatered = $autoPlant["last_watered"];
+    $interval = (int) $autoPlant["watering_interval"];
+
+    if ($interval <= 0) {
+        continue;
+    }
+
+    try {
+        $lastWateredDate = new DateTimeImmutable($lastWatered);
+        $nextDate = $lastWateredDate
+            ->modify("+{$interval} days")
+            ->format("Y-m-d");
+    } catch (Exception $exception) {
+        continue;
+    }
+
+    // Skip dates that are already in the past
+    if ($nextDate < $today) {
+        continue;
+    }
+
+    $plantId = (int) $autoPlant["id"];
+
+    $insertAuto->bind_param(
+        "isis",
+        $plantId,
+        $nextDate,
+        $plantId,
+        $nextDate
+    );
+
+    $insertAuto->execute();
+}
+
+$insertAuto->close();
+
+// 6. Fetch plants belonging to this user
+$stmt = $conn->prepare("
+    SELECT id, plant_name
+    FROM plants
+    WHERE user_id = ?
+    ORDER BY plant_name
+");
 
 $stmt->bind_param("i", $userId);
 $stmt->execute();
@@ -192,21 +266,23 @@ $stmt->execute();
 $plants = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $stmt->close();
 
-// 6. Fetch this user's reminders only
-$sql = "SELECT
-            wr.id,
-            wr.plant_id,
-            wr.reminder_date,
-            wr.status,
-            p.plant_name
-        FROM watering_reminders AS wr
-        INNER JOIN plants AS p
-            ON p.id = wr.plant_id
-        WHERE p.user_id = ?
-        ORDER BY
-            CASE WHEN wr.status = 'pending' THEN 0 ELSE 1 END,
-            wr.reminder_date ASC,
-            wr.id DESC";
+// 7. Fetch this user's reminders
+$sql = "
+    SELECT
+        wr.id,
+        wr.plant_id,
+        wr.reminder_date,
+        wr.status,
+        p.plant_name
+    FROM watering_reminders AS wr
+    INNER JOIN plants AS p
+        ON p.id = wr.plant_id
+    WHERE p.user_id = ?
+    ORDER BY
+        CASE WHEN wr.status = 'pending' THEN 0 ELSE 1 END,
+        wr.reminder_date ASC,
+        wr.id DESC
+";
 
 $stmt = $conn->prepare($sql);
 $stmt->bind_param("i", $userId);
@@ -283,17 +359,14 @@ $stmt->close();
             color: white;
         }
 
-        .primary-button:hover {
+        .primary-button:hover,
+        .complete-button:hover {
             background: #1b5e20;
         }
 
         .complete-button {
             background: #2e7d32;
             color: white;
-        }
-
-        .complete-button:hover {
-            background: #1b5e20;
         }
 
         .back-button {
@@ -382,7 +455,6 @@ $stmt->close();
 
     <section class="panel">
         <h1>💧 Watering Reminders</h1>
-
         <p>Keep track of when your plants need water.</p>
 
         <a class="back-button" href="dashboard.php">
@@ -400,12 +472,10 @@ $stmt->close();
         <h2>➕ Create a Reminder</h2>
 
         <?php if (count($plants) > 0): ?>
-
             <form method="POST" action="reminders.php">
                 <input type="hidden" name="action" value="create">
 
                 <label for="plant_id">Select Plant</label>
-
                 <select id="plant_id" name="plant_id" required>
                     <option value="">Choose a plant</option>
 
@@ -417,12 +487,11 @@ $stmt->close();
                 </select>
 
                 <label for="reminder_date">Reminder Date</label>
-
                 <input
                     type="date"
                     id="reminder_date"
                     name="reminder_date"
-                    min="<?= date("Y-m-d") ?>"
+                    min="<?= e($today) ?>"
                     required
                 >
 
@@ -430,14 +499,11 @@ $stmt->close();
                     Create Reminder
                 </button>
             </form>
-
         <?php else: ?>
-
             <div class="empty-state">
                 <p>You haven't added any plants yet.</p>
                 <a href="add_plant.php">Add your first plant</a>
             </div>
-
         <?php endif; ?>
     </section>
 
@@ -445,14 +511,9 @@ $stmt->close();
         <h2>📅 My Reminders</h2>
 
         <?php if (count($reminders) > 0): ?>
-
             <?php foreach ($reminders as $reminder): ?>
-
                 <?php
-                $status = strtolower(
-                    $reminder["status"] ?? "pending"
-                );
-
+                $status = strtolower($reminder["status"] ?? "pending");
                 $date = $reminder["reminder_date"];
                 $isCompleted = ($status === "completed");
 
@@ -461,7 +522,7 @@ $stmt->close();
                     $statusClass = "completed";
                 } elseif (
                     $status === "overdue" ||
-                    ($status === "pending" && $date < date("Y-m-d"))
+                    ($status === "pending" && $date < $today)
                 ) {
                     $displayStatus = "Overdue";
                     $statusClass = "overdue";
@@ -472,9 +533,7 @@ $stmt->close();
                 ?>
 
                 <article class="reminder-card">
-                    <h3>
-                        🌱 <?= e($reminder["plant_name"]) ?>
-                    </h3>
+                    <h3>🌱 <?= e($reminder["plant_name"]) ?></h3>
 
                     <p>
                         <strong>Reminder date:</strong>
@@ -488,11 +547,7 @@ $stmt->close();
                         </span>
                     </p>
 
-                    <?php if (
-                        $status === "pending" &&
-                        $date >= date("Y-m-d")
-                    ): ?>
-
+                    <?php if ($status === "pending"): ?>
                         <form method="POST" action="reminders.php">
                             <input
                                 type="hidden"
@@ -506,26 +561,18 @@ $stmt->close();
                                 value="<?= (int) $reminder["id"] ?>"
                             >
 
-                            <button
-                                class="complete-button"
-                                type="submit"
-                            >
+                            <button class="complete-button" type="submit">
                                 ✓ Mark as Completed
                             </button>
                         </form>
-
                     <?php endif; ?>
                 </article>
-
             <?php endforeach; ?>
-
         <?php else: ?>
-
             <div class="empty-state">
                 <p>No watering reminders yet.</p>
                 <p>Create a reminder above to get started!</p>
             </div>
-
         <?php endif; ?>
     </section>
 
